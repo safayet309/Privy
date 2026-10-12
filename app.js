@@ -1,4 +1,4 @@
- /* Privy PWA — configure the Supabase URL and publishable/anon key below.
+/* Privy PWA — configure the Supabase URL and publishable/anon key below.
    Never place a Supabase secret or service_role key in browser code. */
 (() => {
   "use strict";
