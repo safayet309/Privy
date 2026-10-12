@@ -1,61 +1,62 @@
-// Bump this on every deploy so old caches are dropped.
-const CACHE = "privy-shell-v2";
-const SHELL = [
-  "./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest",
-  "./icon.svg", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png"
-];
+"use strict";
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(
-    caches.open(CACHE)
-      // Don't let one missing file break installation.
-      .then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => null))))
-      .then(() => self.skipWaiting())
+self.addEventListener("install", (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+// Server থেকে Web Push এলে notification দেখাবে।
+self.addEventListener("push", (event) => {
+  let data = {};
+
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = {
+      title: "New message on Privy",
+      body: event.data ? event.data.text() : "You have a new message."
+    };
+  }
+
+  const title = data.title || "New message on Privy";
+
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: data.body || "You received a new message.",
+      icon: "./icons/icon-192.png",
+      badge: "./icons/icon-192.png",
+      tag: data.tag || "privy-message",
+      data: { url: data.url || "./" },
+      renotify: false
+    })
   );
 });
 
-self.addEventListener("activate", (e) => {
-  e.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
-  );
-});
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
 
-self.addEventListener("fetch", (e) => {
-  const req = e.request;
-  if (req.method !== "GET") return;
-  const url = new URL(req.url);
+  const target = new URL(
+    event.notification.data?.url || "./",
+    self.location.origin
+  ).href;
 
-  // Supabase API / realtime / storage: never touch.
-  if (url.hostname.endsWith("supabase.co")) return;
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({
+      type: "window",
+      includeUncontrolled: true
+    });
 
-  // Same-origin app files: network first (so updates show up), cache as offline fallback.
-  if (url.origin === location.origin) {
-    e.respondWith(
-      fetch(req)
-        .then((res) => {
-          if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
-          return res;
-        })
-        .catch(() =>
-          caches.match(req, { ignoreSearch: true }).then((hit) =>
-            hit || (req.mode === "navigate" ? caches.match("./index.html") : Response.error())
-          )
-        )
-    );
-    return;
-  }
+    for (const client of windows) {
+      if (client.url.startsWith(self.location.origin) && "focus" in client) {
+        await client.focus();
+        client.postMessage({ type: "PRIVY_NOTIFICATION_CLICK" });
+        return;
+      }
+    }
 
-  // Supabase JS library from CDN: cache-first so the app shell can open offline.
-  if (url.hostname === "cdn.jsdelivr.net") {
-    e.respondWith(
-      caches.match(req).then((hit) =>
-        hit || fetch(req).then((res) => {
-          if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
-          return res;
-        })
-      )
-    );
-  }
+    await self.clients.openWindow(target);
+  })());
 });
