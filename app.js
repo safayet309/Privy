@@ -41,7 +41,7 @@
   function isConfigured() { return !(SUPABASE_URL.includes("YOUR_PROJECT") || SUPABASE_PUBLISHABLE_KEY.includes("YOUR_")); }
   function ensureConfigured() {
     if (!window.supabase) { toast("Could not load Supabase library. Check your internet connection."); return false; }
-    if (!isConfigured()) { toast("First add your Supabase URL and publishable key in app.js."); return false; }
+    if (!isConfigured()) { toast("First add your Supabase URL and paaublishable key in app.js."); return false; }
     return true;
   }
   function modal(title, text, confirm = "Confirm", danger = false) {
@@ -279,9 +279,27 @@
   async function markRead() {
     if (!state.active || document.visibilityState !== "visible") return;
     const { error } = await state.client.rpc("mark_messages_read", { target_conversation_id: state.active });
-    if (error) console.warn("Read receipt:", error.message); else scheduleRefresh();
+    if (error) { console.warn("Read receipt:", error.message); return; }
+    const c = state.chats.find((x) => x.id === state.active); if (c && c.unread) { c.unread = 0; renderChats(); }
   }
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { markRead(); pingLastSeen(); } });
+  /* ---- local updates from realtime payloads (no re-fetching) ---- */
+  function chatTime(c) { return new Date(c.last?.created_at || c.updated_at || c.created_at); }
+  function bumpChatFromMessage(m) {
+    const c = state.chats.find((x) => x.id === m.conversation_id);
+    if (!c) { scheduleRefresh(); return; } // brand-new conversation: fetch once
+    c.last = { conversation_id: m.conversation_id, body: m.body, photo_path: m.photo_path, created_at: m.created_at, sender_id: m.sender_id };
+    c.updated_at = m.created_at;
+    if (m.sender_id !== state.user.id && m.conversation_id !== state.active) c.unread = (c.unread || 0) + 1;
+    state.chats.sort((a, b) => chatTime(b) - chatTime(a)); renderChats();
+  }
+  function addMessageLocal(m) {
+    if (m.deleted_at || state.messages.some((x) => x.id === m.id)) return;
+    state.messages.push(m); state.messages.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    if (m.sender_id === state.user.id) state.forceBottom = true;
+    renderMessages();
+    if (m.sender_id !== state.user.id) markRead();
+  }
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && state.user) { if (state.active) loadMessages(); markRead(); pingLastSeen(); } });
 
   /* ---------- sending ---------- */
   async function prepareImage(file) {
@@ -313,9 +331,10 @@
         const { error } = await state.client.storage.from(BUCKET).upload(photo_path, file, { contentType: file.type, upsert: false, cacheControl: "3600" });
         if (error) throw error;
       }
-      const { error } = await state.client.from("messages").insert({ conversation_id: state.active, sender_id: state.user.id, body: body || null, photo_path });
+      const { data: row, error } = await state.client.from("messages").insert({ conversation_id: state.active, sender_id: state.user.id, body: body || null, photo_path }).select().single();
       if (error) { if (photo_path) await state.client.storage.from(BUCKET).remove([photo_path]); throw error; }
-      $("messageInput").value = ""; $("messageInput").style.height = "auto"; clearPhoto(); state.forceBottom = true; await loadMessages(); scheduleRefresh();
+      $("messageInput").value = ""; $("messageInput").style.height = "auto"; clearPhoto();
+      addMessageLocal(row); bumpChatFromMessage(row); // the realtime echo is de-duplicated by id
     } catch (e) { toast(errorText(e)); } finally { $("sendBtn").disabled = false; $("messageInput").focus(); }
   }
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendMessage(); });
@@ -346,7 +365,7 @@
     const { error } = await state.client.rpc("delete_message_everyone", { target_message_id: id });
     if (error) { toast(errorText(error)); return; }
     if (msg.photo_path) await state.client.storage.from(BUCKET).remove([msg.photo_path]);
-    await loadMessages(); scheduleRefresh(); toast("Message deleted for everyone.");
+    state.messages = state.messages.filter((m) => m.id !== id); renderMessages(); scheduleRefresh(); toast("Message deleted for everyone.");
   }
   async function deleteChat() {
     if (!state.active) return;
@@ -398,9 +417,19 @@
     if (state.listChannel) { await state.client.removeChannel(state.listChannel); state.listChannel = null; }
     state.listChannel = state.client.channel("privy-list-updates")
       .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (payload) => {
-        const cid = payload.new?.conversation_id || payload.old?.conversation_id;
-        if (cid && cid === state.active) loadMessages();
-        scheduleRefresh();
+        const m = payload.new;
+        if (payload.eventType === "INSERT") {
+          if (m.conversation_id === state.active) addMessageLocal(m);
+          bumpChatFromMessage(m);
+        } else if (payload.eventType === "UPDATE") {
+          if (m.deleted_at) {
+            if (m.conversation_id === state.active) { state.messages = state.messages.filter((x) => x.id !== m.id); renderMessages(); }
+            scheduleRefresh(); // last message / unread count may have changed
+          } else if (m.conversation_id === state.active) {
+            const i = state.messages.findIndex((x) => x.id === m.id);
+            if (i >= 0) { state.messages[i] = { ...state.messages[i], ...m }; renderMessages(); } // e.g. "Seen"
+          }
+        } else { scheduleRefresh(); }
       })
       // DELETE events cannot be filtered by user in Supabase Realtime, so listen unfiltered and just re-check the list.
       .on("postgres_changes", { event: "*", schema: "public", table: "conversation_members" }, () => scheduleRefresh())
