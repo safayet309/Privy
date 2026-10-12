@@ -2,8 +2,8 @@
    Never place a Supabase secret or service_role key in browser code. */
 (() => {
   "use strict";
-  const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
-  const SUPABASE_PUBLISHABLE_KEY = "YOUR_SUPABASE_PUBLISHABLE_OR_ANON_KEY";
+  const SUPABASE_URL = "https://pteplvsseiwlvqmbhcpu.supabase.co";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_kXRnQzKRdGQvUKLi1apFuA_qndnI41v";
   const BUCKET = "chat-photos";
   const $ = (id) => document.getElementById(id);
   const state = { client:null, user:null, profile:null, signup:false, chats:[], active:null, messages:[], peer:null, selectedPhoto:null, channel:null, presenceChannel:null, online:new Set(), typingTimer:null, modalResolve:null, searchTimer:null, lastSeenTimer:null };
