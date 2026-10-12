@@ -134,7 +134,7 @@
     const ids = (members || []).map((x) => x.conversation_id);
     if (!ids.length) { if (seq === state.refreshSeq) { state.chats = []; renderChats(); checkActiveStillExists(); } return; }
     const [othersRes, perChat] = await Promise.all([
-      state.client.from("conversation_members").select("conversation_id,user_id,profiles(id,username,display_name,avatar_url,last_seen)").in("conversation_id", ids).neq("user_id", state.user.id).is("deleted_at", null),
+      state.client.from("conversation_members").select("conversation_id,user_id").in("conversation_id", ids).neq("user_id", state.user.id).is("deleted_at", null),
       Promise.all(ids.map(async (id) => {
         const [last, unread] = await Promise.all([
           state.client.from("messages").select("conversation_id,body,photo_path,created_at,sender_id").eq("conversation_id", id).is("deleted_at", null).order("created_at", { ascending: false }).limit(1),
@@ -144,8 +144,18 @@
       }))
     ]);
     if (seq !== state.refreshSeq) return; // a newer refresh is in flight
-    if (othersRes.error) { console.error(othersRes.error); return; }
-    const others = othersRes.data || [];
+    if (othersRes.error) { console.error(othersRes.error); toast("Could not load chat members: " + othersRes.error.message); return; }
+    // conversation_members has no direct FK to profiles (both point to auth.users), so a PostgREST embed fails.
+    // Fetch the profiles separately and join them here.
+    const peerIds = [...new Set((othersRes.data || []).map((m) => m.user_id))];
+    let profileMap = new Map();
+    if (peerIds.length) {
+      const { data: profs, error: profErr } = await state.client.from("profiles").select("id,username,display_name,avatar_url,last_seen").in("id", peerIds);
+      if (profErr) { console.error(profErr); toast("Could not load profiles: " + profErr.message); return; }
+      profileMap = new Map((profs || []).map((p) => [p.id, p]));
+    }
+    if (seq !== state.refreshSeq) return;
+    const others = (othersRes.data || []).map((m) => ({ ...m, profiles: profileMap.get(m.user_id) || null }));
     state.chats = ids.map((id) => {
       const member = members.find((m) => m.conversation_id === id), other = others.find((m) => m.conversation_id === id), extra = perChat.find((p) => p.id === id);
       return { id, created_at: member?.conversations?.created_at, updated_at: member?.conversations?.updated_at, peer: other?.profiles || null, last: extra?.last || null, unread: id === state.active ? 0 : (extra?.unread || 0) };
@@ -217,7 +227,7 @@
   /* ---------- conversation ---------- */
   async function openChat(id) {
     if (!state.chats.find((c) => c.id === id)) await refreshChats();
-    const chosen = state.chats.find((c) => c.id === id); if (!chosen) return;
+    const chosen = state.chats.find((c) => c.id === id); if (!chosen) { toast("Could not open this conversation."); return; }
     if (state.channel) { await state.client.removeChannel(state.channel); state.channel = null; }
     state.active = id; state.peer = chosen.peer; state.messages = []; state.forceBottom = true; chosen.unread = 0; renderChats();
     $("peerName").textContent = chosen.peer.display_name || chosen.peer.username; setAvatar($("peerAvatar"), chosen.peer);
