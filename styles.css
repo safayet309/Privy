@@ -72,3 +72,8 @@ input:focus-visible,textarea:focus-visible{outline:none}
   .composer{padding-bottom:max(6px,env(safe-area-inset-bottom))}
 }
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+/* Fix: decorative orbs stuck out of the panel and created a horizontal scrollbar */
+.welcome-view,.auth-view{overflow-x:hidden;overflow-y:auto}
+.main-panel{min-width:0}
+.welcome-orb{max-width:100%}
