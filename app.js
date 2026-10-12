@@ -5,6 +5,10 @@
   const SUPABASE_URL = "https://pteplvsseiwlvqmbhcpu.supabase.co";
   const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_kXRnQzKRdGQvUKLi1apFuA_qndnI41v";
   const BUCKET = "chat-photos";
+  
+  // এখানে VAPID PUBLIC key বসাবেন। Private key কখনো frontend-এ নয়।
+  const VAPID_PUBLIC_KEY = "PASTE_YOUR_VAPID_PUBLIC_KEY_HERE";
+
   const $ = (id) => document.getElementById(id);
   const state = {
     client: null, user: null, profile: null, signup: false,
@@ -17,11 +21,6 @@
     urlCache: new Map(), forceBottom: false
   };
   const appShell = document.querySelector(".app-shell");
-
-  /* ---------- PWA: register early, independent of auth/config ---------- */
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(console.warn));
-  }
 
   /* ---------- helpers ---------- */
   function toast(message) { const el = $("toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 3200); }
@@ -41,7 +40,7 @@
   function isConfigured() { return !(SUPABASE_URL.includes("YOUR_PROJECT") || SUPABASE_PUBLISHABLE_KEY.includes("YOUR_")); }
   function ensureConfigured() {
     if (!window.supabase) { toast("Could not load Supabase library. Check your internet connection."); return false; }
-    if (!isConfigured()) { toast("First add your Supabase URL and paaublishable key in app.js."); return false; }
+    if (!isConfigured()) { toast("First add your Supabase URL and publishable key in app.js."); return false; }
     return true;
   }
   function modal(title, text, confirm = "Confirm", danger = false) {
@@ -51,6 +50,133 @@
   $("modalCancel").onclick = () => { show($("modalBackdrop"), false); state.modalResolve?.(false); };
   $("modalConfirm").onclick = () => { show($("modalBackdrop"), false); state.modalResolve?.(true); };
   $("modalBackdrop").addEventListener("click", (e) => { if (e.target === $("modalBackdrop")) $("modalCancel").click(); });
+
+  /* ---------- PWA install + service worker ---------- */
+  let deferredInstallPrompt = null;
+  let privyServiceWorker = null;
+
+  async function registerPrivyPWA() {
+    if (!("serviceWorker" in navigator)) {
+      console.warn("Service Workers are not supported.");
+      return;
+    }
+    try {
+      privyServiceWorker = await navigator.serviceWorker.register("./sw.js");
+      console.log("Privy Service Worker registered.");
+    } catch (error) {
+      console.error("Privy Service Worker registration failed:", error);
+    }
+  }
+
+  window.addEventListener("load", registerPrivyPWA);
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    const button = document.getElementById("installAppBtn");
+    if (button) button.hidden = false;
+  });
+
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    const button = document.getElementById("installAppBtn");
+    if (button) button.hidden = true;
+    toast("Privy installed successfully.");
+  });
+
+  document.getElementById("installAppBtn")?.addEventListener("click", async () => {
+    if (!deferredInstallPrompt) {
+      toast("Chrome menu থেকে Add to Home screen বা Install app নির্বাচন করুন।");
+      return;
+    }
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    const button = document.getElementById("installAppBtn");
+    if (button) button.hidden = true;
+  });
+
+  /* ---------- Push notification subscription ---------- */
+  function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding)
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+
+    const raw = atob(base64);
+    return Uint8Array.from(raw, (char) => char.charCodeAt(0));
+  }
+
+  async function enablePrivyNotifications() {
+    if (!state.user || !state.client) {
+      toast("প্রথমে Privy-তে sign in করুন।");
+      return;
+    }
+    if (!("Notification" in window) || !("PushManager" in window)) {
+      toast("এই browser-এ push notification সমর্থিত নয়।");
+      return;
+    }
+    if (!VAPID_PUBLIC_KEY || VAPID_PUBLIC_KEY.includes("PASTE_YOUR")) {
+      toast("আগে VAPID public key সেটআপ করতে হবে।");
+      return;
+    }
+
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        toast("Notification permission দেওয়া হয়নি।");
+        return;
+      }
+      const registration = privyServiceWorker || await navigator.serviceWorker.ready;
+      let subscription = await registration.pushManager.getSubscription();
+
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
+        });
+      }
+
+      const { error } = await state.client
+        .from("push_subscriptions")
+        .upsert({
+          user_id: state.user.id,
+          endpoint: subscription.endpoint,
+          subscription: subscription.toJSON()
+        }, {
+          onConflict: "endpoint"
+        });
+
+      if (error) throw error;
+      toast("Privy notifications enabled.");
+    } catch (error) {
+      console.error("Push subscription error:", error);
+      toast("Notification setup failed: " + errorText(error));
+    }
+  }
+
+  document.getElementById("enableNotificationsBtn")?.addEventListener("click", enablePrivyNotifications);
+
+  async function notifyIncomingMessage(message) {
+    if (!state.user || message.sender_id === state.user.id) return;
+    
+    // যে conversation বর্তমানে খোলা আছে, তার notification দেখাবে না।
+    if (message.conversation_id === state.active && document.visibilityState === "visible") return;
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+
+    try {
+      const registration = privyServiceWorker || await navigator.serviceWorker.ready;
+      await registration.showNotification("New message on Privy", {
+        body: "You received a new message.",
+        icon: "./icons/icon-192.png",
+        badge: "./icons/icon-192.png",
+        tag: "privy-" + message.conversation_id,
+        data: { url: "./" }
+      });
+    } catch (error) {
+      console.warn("Notification display failed:", error);
+    }
+  }
 
   /* ---------- auth ---------- */
   function authMode(signup) {
@@ -143,10 +269,8 @@
         return { id, last: last.data?.[0] || null, unread: unread.count || 0 };
       }))
     ]);
-    if (seq !== state.refreshSeq) return; // a newer refresh is in flight
+    if (seq !== state.refreshSeq) return; 
     if (othersRes.error) { console.error(othersRes.error); toast("Could not load chat members: " + othersRes.error.message); return; }
-    // conversation_members has no direct FK to profiles (both point to auth.users), so a PostgREST embed fails.
-    // Fetch the profiles separately and join them here.
     const peerIds = [...new Set((othersRes.data || []).map((m) => m.user_id))];
     let profileMap = new Map();
     if (peerIds.length) {
@@ -183,7 +307,7 @@
     root.querySelectorAll("[data-chat]").forEach((b) => (b.onclick = () => openChat(b.dataset.chat)));
   }
 
-  /* ---------- search (FIXED: isBlocked is async, so the old filter dropped every result) ---------- */
+  /* ---------- search ---------- */
   $("userSearch").addEventListener("input", () => {
     clearTimeout(state.searchTimer); const q = $("userSearch").value.trim().replace(/^@/, "");
     if (q.length < 2) { show($("searchResults"), false); return; }
@@ -194,7 +318,6 @@
     const clean = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
     if (raw.length < 2 || clean.length < 2 && !raw.includes(" ")) { $("searchResults").innerHTML = '<div class="empty-side">Search with a name or @username (at least 2 characters).</div>'; show($("searchResults")); return; }
     const seq = ++state.searchSeq;
-    // Search both public display names and usernames; merge duplicates and prioritize exact prefixes.
     const usernamePattern = "%" + clean.replace(/[%_]/g, (m) => "\\" + m) + "%";
     const namePattern = "%" + raw.replace(/[%_]/g, (m) => "\\" + m) + "%";
     const base = () => state.client.from("profiles").select("id,username,display_name,avatar_url,last_seen").neq("id", state.user.id).limit(20);
@@ -202,7 +325,7 @@
       clean.length >= 2 ? base().ilike("username", usernamePattern) : Promise.resolve({ data: [], error: null }),
       base().ilike("display_name", namePattern)
     ]);
-    if (seq !== state.searchSeq) return; // ignore stale responses while typing
+    if (seq !== state.searchSeq) return; 
     if (userResult.error && nameResult.error) { toast(errorText(userResult.error)); return; }
     const merged = new Map();
     [...(userResult.data || []), ...(nameResult.data || [])].forEach((p) => merged.set(p.id, p));
@@ -244,7 +367,7 @@
     const chosen = state.chats.find((c) => c.id === id); if (!chosen) { toast("Could not open this conversation."); return; }
     if (state.channel) { await state.client.removeChannel(state.channel); state.channel = null; }
     state.active = id; state.peer = chosen.peer; state.messages = []; state.forceBottom = true; chosen.unread = 0; renderChats();
-    $("peerName").textContent = chosen.peer.display_name || chosen.peer.username; setAvatar($("peerAvatar"), chosen.peer);
+    $("peerName").textContent = chosen.peer.display_name \vert{}\vert{} chosen.peer.username; setAvatar($("peerAvatar"), chosen.peer);
     show($("typingLine"), false); updatePeerStatus(); show($("welcomeView"), false); show($("chatView"), true); appShell.classList.add("chat-open"); show($("chatMenu"), false);
     state.channel = state.client.channel("chat:" + id);
     state.channel.on("broadcast", { event: "typing" }, (payload) => {
@@ -257,7 +380,6 @@
   async function loadMessages() {
     if (!state.active) return;
     const id = state.active, seq = ++state.loadSeq;
-    // newest 300, then reversed (the old ascending+limit(500) hid the NEWEST messages once a chat grew past 500)
     const { data, error } = await state.client.from("messages").select("*").eq("conversation_id", id).is("deleted_at", null).order("created_at", { ascending: false }).limit(300);
     if (error) { toast("Could not load messages: " + errorText(error)); return; }
     if (seq !== state.loadSeq || id !== state.active) return;
@@ -274,7 +396,7 @@
     const area = $("messageArea"), seq = ++state.renderSeq, snapshot = state.messages;
     const nearBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 120;
     if (!snapshot.length) { area.innerHTML = '<div class="message-empty"><b>It starts with a hello.</b>Send a message or share a photo to get things going.</div>'; return; }
-    const urls = await Promise.all(snapshot.map((m) => (m.photo_path ? signedUrl(m.photo_path) : null))); // parallel, cached
+    const urls = await Promise.all(snapshot.map((m) => (m.photo_path ? signedUrl(m.photo_path) : null)));
     if (seq !== state.renderSeq) return;
     const rows = []; let lastDay = "";
     snapshot.forEach((m, i) => {
@@ -296,11 +418,10 @@
     if (error) { console.warn("Read receipt:", error.message); return; }
     const c = state.chats.find((x) => x.id === state.active); if (c && c.unread) { c.unread = 0; renderChats(); }
   }
-  /* ---- local updates from realtime payloads (no re-fetching) ---- */
   function chatTime(c) { return new Date(c.last?.created_at || c.updated_at || c.created_at); }
   function bumpChatFromMessage(m) {
     const c = state.chats.find((x) => x.id === m.conversation_id);
-    if (!c) { scheduleRefresh(); return; } // brand-new conversation: fetch once
+    if (!c) { scheduleRefresh(); return; }
     c.last = { conversation_id: m.conversation_id, body: m.body, photo_path: m.photo_path, created_at: m.created_at, sender_id: m.sender_id };
     c.updated_at = m.created_at;
     if (m.sender_id !== state.user.id && m.conversation_id !== state.active) c.unread = (c.unread || 0) + 1;
@@ -317,7 +438,6 @@
 
   /* ---------- sending ---------- */
   async function prepareImage(file) {
-    // Resize/compress to JPEG (max 1600px). Falls back to the original file if the browser can't decode it.
     if (file.type === "image/gif") return file;
     try {
       const bmp = await createImageBitmap(file); const max = 1600, scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
@@ -348,7 +468,7 @@
       const { data: row, error } = await state.client.from("messages").insert({ conversation_id: state.active, sender_id: state.user.id, body: body || null, photo_path }).select().single();
       if (error) { if (photo_path) await state.client.storage.from(BUCKET).remove([photo_path]); throw error; }
       $("messageInput").value = ""; $("messageInput").style.height = "auto"; clearPhoto();
-      addMessageLocal(row); bumpChatFromMessage(row); // the realtime echo is de-duplicated by id
+      addMessageLocal(row); bumpChatFromMessage(row); 
     } catch (e) { toast(errorText(e)); } finally { $("sendBtn").disabled = false; $("messageInput").focus(); }
   }
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendMessage(); });
@@ -358,7 +478,7 @@
     const el = $("messageInput"); el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 130) + "px";
     if (!state.channel) return;
     const now = Date.now();
-    if (now - state.lastTypingSent > 1500) { state.lastTypingSent = now; state.channel.send({ type: "broadcast", event: "typing", payload: { user_id: state.user.id, typing: true } }); } // throttled (was: every keystroke)
+    if (now - state.lastTypingSent > 1500) { state.lastTypingSent = now; state.channel.send({ type: "broadcast", event: "typing", payload: { user_id: state.user.id, typing: true } }); }
     clearTimeout(state.myTypingTimer);
     state.myTypingTimer = setTimeout(() => { state.lastTypingSent = 0; state.channel?.send({ type: "broadcast", event: "typing", payload: { user_id: state.user.id, typing: false } }); }, 1600);
   });
@@ -385,7 +505,7 @@
     if (!state.active) return;
     const yes = await modal("Delete chat for both?", "This permanently removes the conversation and its messages from both users' chat lists. This cannot be undone.", "Delete chat", true); if (!yes) return;
     const id = state.active;
-    try { // best-effort photo cleanup before the DB rows are removed
+    try { 
       const { data: files } = await state.client.storage.from(BUCKET).list(id, { limit: 1000 });
       for (const folder of (files || []).filter((f) => !f.id)) {
         const { data: inside } = await state.client.storage.from(BUCKET).list(id + "/" + folder.name, { limit: 1000 });
@@ -427,7 +547,6 @@
       .subscribe(async (status) => { if (status === "SUBSCRIBED") await state.presenceChannel.track({ user_id: state.user.id, online_at: new Date().toISOString() }); });
   }
   async function setupRealtime() {
-    // Previously this channel was never removed on sign-out, so every re-login stacked another listener.
     if (state.listChannel) { await state.client.removeChannel(state.listChannel); state.listChannel = null; }
     state.listChannel = state.client.channel("privy-list-updates")
       .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (payload) => {
@@ -435,17 +554,18 @@
         if (payload.eventType === "INSERT") {
           if (m.conversation_id === state.active) addMessageLocal(m);
           bumpChatFromMessage(m);
+          // নতুন মেসেজ আসলে নোটিফিকেশন পাঠাবে
+          notifyIncomingMessage(m);
         } else if (payload.eventType === "UPDATE") {
           if (m.deleted_at) {
             if (m.conversation_id === state.active) { state.messages = state.messages.filter((x) => x.id !== m.id); renderMessages(); }
-            scheduleRefresh(); // last message / unread count may have changed
+            scheduleRefresh(); 
           } else if (m.conversation_id === state.active) {
             const i = state.messages.findIndex((x) => x.id === m.id);
-            if (i >= 0) { state.messages[i] = { ...state.messages[i], ...m }; renderMessages(); } // e.g. "Seen"
+            if (i >= 0) { state.messages[i] = { ...state.messages[i], ...m }; renderMessages(); } 
           }
         } else { scheduleRefresh(); }
       })
-      // DELETE events cannot be filtered by user in Supabase Realtime, so listen unfiltered and just re-check the list.
       .on("postgres_changes", { event: "*", schema: "public", table: "conversation_members" }, () => scheduleRefresh())
       .subscribe();
   }
