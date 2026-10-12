@@ -1,4 +1,4 @@
-/* Privy PWA — configure the Supabase URL and publishable/anon key below.
+ /* Privy PWA — configure the Supabase URL and publishable/anon key below.
    Never place a Supabase secret or service_role key in browser code. */
 (() => {
   "use strict";
@@ -190,14 +190,28 @@
     state.searchTimer = setTimeout(() => searchUsers(q), 250);
   });
   async function searchUsers(q) {
-    const clean = q.toLowerCase().replace(/[^a-z0-9_]/g, "");
-    if (clean.length < 2) { $("searchResults").innerHTML = '<div class="empty-side">Usernames use letters, numbers and underscores.</div>'; show($("searchResults")); return; }
+    const raw = q.trim().replace(/^@/, "");
+    const clean = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+    if (raw.length < 2 || clean.length < 2 && !raw.includes(" ")) { $("searchResults").innerHTML = '<div class="empty-side">Search with a name or @username (at least 2 characters).</div>'; show($("searchResults")); return; }
     const seq = ++state.searchSeq;
-    const pattern = "%" + clean.replace(/_/g, "\\_") + "%"; // escape "_" (a wildcard in LIKE)
-    const { data, error } = await state.client.from("profiles").select("id,username,display_name,avatar_url,last_seen").ilike("username", pattern).neq("id", state.user.id).limit(20);
-    if (seq !== state.searchSeq) return; // stale response
-    if (error) { toast(errorText(error)); return; }
-    const results = (data || []).sort((a, b) => (b.username.startsWith(clean) - a.username.startsWith(clean)) || a.username.localeCompare(b.username)).slice(0, 12);
+    // Search both public display names and usernames; merge duplicates and prioritize exact prefixes.
+    const usernamePattern = "%" + clean.replace(/[%_]/g, (m) => "\\" + m) + "%";
+    const namePattern = "%" + raw.replace(/[%_]/g, (m) => "\\" + m) + "%";
+    const base = () => state.client.from("profiles").select("id,username,display_name,avatar_url,last_seen").neq("id", state.user.id).limit(20);
+    const [userResult, nameResult] = await Promise.all([
+      clean.length >= 2 ? base().ilike("username", usernamePattern) : Promise.resolve({ data: [], error: null }),
+      base().ilike("display_name", namePattern)
+    ]);
+    if (seq !== state.searchSeq) return; // ignore stale responses while typing
+    if (userResult.error && nameResult.error) { toast(errorText(userResult.error)); return; }
+    const merged = new Map();
+    [...(userResult.data || []), ...(nameResult.data || [])].forEach((p) => merged.set(p.id, p));
+    const results = [...merged.values()].sort((a, b) => {
+      const au = (a.username || "").toLowerCase(), bu = (b.username || "").toLowerCase();
+      const an = (a.display_name || "").toLowerCase(), bn = (b.display_name || "").toLowerCase();
+      const score = (p, u, n) => (u === clean ? 0 : u.startsWith(clean) ? 1 : n.startsWith(raw.toLowerCase()) ? 2 : 3);
+      return score(a, au, an) - score(b, bu, bn) || au.localeCompare(bu);
+    }).slice(0, 12);
     $("searchResults").innerHTML = results.length ? results.map((p) => {
       const blocked = state.blocked.has(p.id);
       return `<button class="search-result" ${blocked ? `data-unblock="${p.id}"` : `data-user="${p.id}"`}>${avatarHTML(p)}<div><span>${esc(p.display_name || p.username)}</span><small>${blocked ? "Blocked · tap to unblock" : "@" + esc(p.username)}</small></div></button>`;
