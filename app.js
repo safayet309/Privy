@@ -23,6 +23,38 @@
     window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(console.warn));
   }
 
+  /* ---------- PWA: install button + notification permission ---------- */
+  let deferredInstall = null;
+  const installBtn = $("installAppBtn"), notifyBtn = $("enableNotificationsBtn");
+  window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; if (installBtn) installBtn.hidden = false; });
+  window.addEventListener("appinstalled", () => { deferredInstall = null; if (installBtn) installBtn.hidden = true; });
+  if (installBtn) installBtn.addEventListener("click", async () => {
+    if (!deferredInstall) return;
+    deferredInstall.prompt();
+    try { await deferredInstall.userChoice; } catch (_) {}
+    deferredInstall = null; installBtn.hidden = true;
+  });
+  function syncNotifyBtn() { if (notifyBtn) notifyBtn.hidden = !("Notification" in window) || Notification.permission !== "default"; }
+  if (notifyBtn) notifyBtn.addEventListener("click", async () => {
+    if (!("Notification" in window)) return toast("This browser does not support notifications.");
+    try { const result = await Notification.requestPermission(); toast(result === "granted" ? "Notifications enabled." : "Notifications were not allowed."); } catch (_) {}
+    syncNotifyBtn();
+  });
+  syncNotifyBtn();
+  async function notifyIncoming(m) {
+    if (!("Notification" in window) || Notification.permission !== "granted" || !state.user) return;
+    if (m.sender_id === state.user.id) return;
+    if (document.visibilityState === "visible" && m.conversation_id === state.active) return;
+    const chat = state.chats.find((c) => c.id === m.conversation_id);
+    const title = chat?.peer ? (chat.peer.display_name || chat.peer.username) : "New message on Privy";
+    const body = m.photo_path && !m.body ? "Sent a photo" : String(m.body || "New message").slice(0, 120);
+    try {
+      const reg = await navigator.serviceWorker?.getRegistration();
+      if (reg) await reg.showNotification(title, { body, icon: "./icons/icon-192.png", badge: "./icons/icon-192.png", tag: "privy-" + m.conversation_id, data: { url: "./" } });
+      else new Notification(title, { body });
+    } catch (e) { console.warn("Notification skipped", e); }
+  }
+
   /* ---------- helpers ---------- */
   function toast(message) { const el = $("toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 3200); }
   function show(el, yes = true) { el.classList.toggle("hidden", !yes); }
@@ -38,10 +70,18 @@
     return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" }).toUpperCase();
   }
   function errorText(error) { return error?.message || "Something went wrong. Please try again."; }
+  function friendlyAuthError(error) {
+    const msg = (error?.message || "").toLowerCase();
+    if (msg.includes("invalid login credentials")) return "Wrong email or password.";
+    if (msg.includes("email not confirmed")) return "Please confirm your email first (check your inbox), then sign in.";
+    if (msg.includes("rate limit")) return "Too many emails were sent. Please wait a while and try again.";
+    if (msg.includes("failed to fetch") || msg.includes("networkerror")) return "Cannot reach Supabase. Check your internet connection or the project URL.";
+    return errorText(error);
+  }
   function isConfigured() { return !(SUPABASE_URL.includes("YOUR_PROJECT") || SUPABASE_PUBLISHABLE_KEY.includes("YOUR_")); }
   function ensureConfigured() {
     if (!window.supabase) { toast("Could not load Supabase library. Check your internet connection."); return false; }
-    if (!isConfigured()) { toast("First add your Supabase URL and paaublishable key in app.js."); return false; }
+    if (!isConfigured()) { toast("First add your Supabase URL and publishable key in app.js."); return false; }
     return true;
   }
   function modal(title, text, confirm = "Confirm", danger = false) {
@@ -66,6 +106,7 @@
   $("authSwitch").onclick = () => authMode(!state.signup);
   $("authForm").addEventListener("submit", async (e) => {
     e.preventDefault(); if (!ensureConfigured()) return;
+    if (!state.client) { toast("App is not ready yet. Please reload the page."); return; }
     const email = $("authEmail").value.trim(), password = $("authPassword").value, username = $("authUsername").value.trim().toLowerCase();
     const btn = $("authSubmit"); btn.disabled = true;
     try {
@@ -75,20 +116,23 @@
         if (!availErr && free === false) throw new Error("That username is already taken.");
         const { data, error } = await state.client.auth.signUp({ email, password, options: { data: { username, display_name: username }, emailRedirectTo: location.origin + location.pathname } });
         if (error) throw error;
+        // Supabase hides "already registered" emails by returning a user with no identities.
+        if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) throw new Error("This email is already registered. Please sign in.");
         if (data.session) { state.user = data.user; await enterApp(); }
         else toast("Account created. Check your email to confirm, then sign in.");
       } else {
         const { data, error } = await state.client.auth.signInWithPassword({ email, password }); if (error) throw error;
         state.user = data.user; await enterApp();
       }
-    } catch (err) { toast(errorText(err)); } finally { btn.disabled = false; }
+    } catch (err) { toast(friendlyAuthError(err)); } finally { btn.disabled = false; }
   });
   async function ensureProfile(usernameHint) {
     const { data: existing, error } = await state.client.from("profiles").select("*").eq("id", state.user.id).maybeSingle();
     if (error) throw error;
     if (existing) { state.profile = existing; return existing; }
     const meta = state.user.user_metadata || {};
-    const username = (usernameHint || meta.username || state.user.email.split("@")[0]).toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 24);
+    let username = (usernameHint || meta.username || state.user.email.split("@")[0]).toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 24);
+    if (username.length < 3) username = "user_" + state.user.id.replace(/-/g, "").slice(0, 8);
     const row = { id: state.user.id, username, display_name: meta.display_name || username };
     const { data, error: insertError } = await state.client.from("profiles").insert(row).select().single();
     if (insertError) throw insertError; state.profile = data; return data;
@@ -98,7 +142,9 @@
     appShell.classList.remove("signed-out");
     show($("authView"), false); show($("welcomeView"), true); show($("chatView"), false);
     $("myName").textContent = state.profile.display_name || state.profile.username; $("myEmail").textContent = "@" + state.profile.username; setAvatar($("myAvatar"), state.profile);
-    await loadBlocks(); await refreshChats(); await setupPresence(); await setupRealtime(); startLastSeen();
+    try {
+      await loadBlocks(); await refreshChats(); await setupPresence(); await setupRealtime(); startLastSeen();
+    } catch (e) { console.error(e); toast("Some features failed to start: " + errorText(e)); }
     const params = new URLSearchParams(location.search), invite = params.get("u");
     if (invite) { history.replaceState({}, "", location.pathname); await openUsername(invite); }
   }
@@ -183,13 +229,14 @@
     root.querySelectorAll("[data-chat]").forEach((b) => (b.onclick = () => openChat(b.dataset.chat)));
   }
 
-  /* ---------- search (FIXED: isBlocked is async, so the old filter dropped every result) ---------- */
+  /* ---------- search (isBlocked is async, so blocked state is read from the local map) ---------- */
   $("userSearch").addEventListener("input", () => {
     clearTimeout(state.searchTimer); const q = $("userSearch").value.trim().replace(/^@/, "");
     if (q.length < 2) { show($("searchResults"), false); return; }
     state.searchTimer = setTimeout(() => searchUsers(q), 250);
   });
   async function searchUsers(q) {
+    if (!state.user) return;
     const raw = q.trim().replace(/^@/, "");
     const clean = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
     if (raw.length < 2 || clean.length < 2 && !raw.includes(" ")) { $("searchResults").innerHTML = '<div class="empty-side">Search with a name or @username (at least 2 characters).</div>'; show($("searchResults")); return; }
@@ -287,7 +334,9 @@
     });
     area.innerHTML = rows.join("");
     area.querySelectorAll("[data-delete]").forEach((b) => (b.onclick = () => deleteMessage(b.dataset.delete)));
-    area.querySelectorAll("[data-photo]").forEach((img) => (img.onclick = () => window.open(img.dataset.photo, "_blank", "noopener")));
+    area.querySelectorAll("[data-photo]").forEach((img) => (img.onclick = (e) => { e.stopPropagation(); window.open(img.dataset.photo, "_blank", "noopener"); }));
+    // Touch devices have no hover: tap your own message to reveal its Delete button (needs the .show-actions CSS rule).
+    area.querySelectorAll(".message-row.mine .message-bubble").forEach((b) => (b.onclick = () => b.closest(".message-row").classList.toggle("show-actions")));
     if (nearBottom || state.forceBottom) { area.scrollTop = area.scrollHeight; state.forceBottom = false; }
   }
   async function markRead() {
@@ -434,6 +483,7 @@
         const m = payload.new;
         if (payload.eventType === "INSERT") {
           if (m.conversation_id === state.active) addMessageLocal(m);
+          notifyIncoming(m);
           bumpChatFromMessage(m);
         } else if (payload.eventType === "UPDATE") {
           if (m.deleted_at) {
@@ -468,10 +518,12 @@
     appShell.classList.add("signed-out"); show($("authView"), true); show($("welcomeView"), false); show($("chatView"), false);
     if (!window.supabase) { toast("Could not load Supabase library. Check your internet connection."); return; }
     if (!isConfigured()) return;
-    state.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
-    state.client.auth.onAuthStateChange((event) => { if (event === "SIGNED_OUT" && state.user) teardown(); });
-    const { data: { session } } = await state.client.auth.getSession();
-    if (session) { state.user = session.user; await enterApp(); }
+    try {
+      state.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+      state.client.auth.onAuthStateChange((event) => { if (event === "SIGNED_OUT" && state.user) teardown(); });
+      const { data: { session } } = await state.client.auth.getSession();
+      if (session) { state.user = session.user; await enterApp(); }
+    } catch (e) { console.error(e); toast("Startup problem: " + friendlyAuthError(e)); }
   }
   boot();
 })();
